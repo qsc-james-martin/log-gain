@@ -2,8 +2,8 @@
 -- A drop-in replacement for the Q-SYS Gain component. It looks and wires like
 -- a Gain block, but the fader uses a mixer-style logarithmic taper by default.
 --
--- Signal path: one embedded mono Q-SYS "gain" block per channel, all driven
--- from a single set of controls. With Meters enabled, each gain output also
+-- Signal path: one embedded Q-SYS "gain" block, configured as Mono, Stereo or
+-- Multi-Channel (2-256 channels). With Meters enabled, each gain output also
 -- feeds an embedded mono "meter2" Level Meter (post-gain).
 --
 -- Pages:
@@ -42,8 +42,8 @@
 
 PluginInfo = {
     Name = "Log Gain",
-    Version = "1.1.2",
-    BuildVersion = "1.1.2",
+    Version = "1.1.3",
+    BuildVersion = "1.1.3",
     Id = "5594a024-13d9-4be2-bd49-62daec2b624e",
     Author = "James Martin",
     Description = "Gain component with an embedded gain block and a mixer-style logarithmic fader taper."
@@ -72,7 +72,7 @@ DEFAULT_RAMP_TIME_S = 5
 ABS_MAX_GAIN = 20
 ABS_MIN_GAIN = -100
 
-MAX_CHANNELS = 64
+MAX_CHANNELS = 256
 
 METER_MIN = -60
 METER_MAX = 20
@@ -186,7 +186,16 @@ end
 
 
 function ChannelCount(props)
-    return math.floor(Clamp(PropNumber(props, "Channel Count", 1), 1, MAX_CHANNELS))
+    if props["Type"].Value == "Mono" then return 1 end
+    if props["Type"].Value == "Stereo" then return 2 end
+    return math.floor(Clamp(PropNumber(props, "Count", 2), 2, MAX_CHANNELS))
+end
+
+
+function ChannelType(props)
+    if props["Type"].Value == "Mono" then return 1 end
+    if props["Type"].Value == "Stereo" then return 2 end
+    return 3
 end
 
 
@@ -256,8 +265,8 @@ function ControlName(base, count, index)
 end
 
 
-function GainBlockName(index)
-    return "gain_block_" .. tostring(index)
+function GainBlockName()
+    return "gain_block_1"
 end
 
 
@@ -287,11 +296,17 @@ end
 function GetProperties()
     return {
         {
-            Name = "Channel Count",
+            Name = "Type",
+            Type = "enum",
+            Choices = { "Mono", "Stereo", "Multi-Channel" },
+            Value = "Mono"
+        },
+        {
+            Name = "Count",
             Type = "integer",
-            Min = 1,
+            Min = 2,
             Max = MAX_CHANNELS,
-            Value = 1
+            Value = 2
         },
         {
             Name = "Taper",
@@ -343,6 +358,7 @@ end
 function RectifyProperties(props)
     local ramp = RampEnabled(props)
 
+    props["Count"].IsHidden = props["Type"].Value ~= "Multi-Channel"
     props["Ramp Mode"].IsHidden = not ramp
     props["Number of Steps"].IsHidden = not RampDiscrete(props)
 
@@ -407,17 +423,18 @@ function GetComponents(props)
     local minDb, maxDb = GainRange(props)
     local meters = MetersEnabled(props)
 
-    for i = 1, ChannelCount(props) do
-        components[#components + 1] = {
-            Name = GainBlockName(i),
-            Type = "gain",
-            Properties = {
-                ["max_gain"] = maxDb,
-                ["min_gain"] = minDb,
-                ["multi_channel_type"] = 1
-            }
+    components[1] = {
+        Name = GainBlockName(),
+        Type = "gain",
+        Properties = {
+            ["max_gain"] = maxDb,
+            ["min_gain"] = minDb,
+            ["multi_channel_type"] = ChannelType(props),
+            ["multi_channel_count"] = ChannelCount(props)
         }
+    }
 
+    for i = 1, ChannelCount(props) do
         if meters then
             components[#components + 1] = {
                 Name = MeterBlockName(i),
@@ -437,12 +454,12 @@ function GetWiring(props)
     local meters = MetersEnabled(props)
 
     for i = 1, count do
-        local block = GainBlockName(i)
-        wiring[#wiring + 1] = { PinName("Input", count, i), block .. " Input 1" }
-        wiring[#wiring + 1] = { block .. " Output 1", PinName("Output", count, i) }
+        local block = GainBlockName()
+        wiring[#wiring + 1] = { PinName("Input", count, i), block .. " Input " .. i }
+        wiring[#wiring + 1] = { block .. " Output " .. i, PinName("Output", count, i) }
 
         if meters then
-            wiring[#wiring + 1] = { block .. " Output 1", MeterBlockName(i) .. " Input 1" }
+            wiring[#wiring + 1] = { block .. " Output " .. i, MeterBlockName(i) .. " Input 1" }
         end
     end
 
@@ -867,17 +884,14 @@ if Controls then
     TICK_S        = 0.05
     CLICK_STEP_DB = 1
 
-    GainBlocks = {}
-
-    for i = 1, CHANNEL_COUNT do
-        GainBlocks[i] = _G[GainBlockName(i)]
+    GainBlock = _G[GainBlockName()]
+    if not GainBlock then
+        error("Log Gain: embedded gain block '" .. GainBlockName() .. "' is missing.")
     end
 
 
     function SetBlocks(controlName, field, value)
-        for _, block in ipairs(GainBlocks) do
-            block[controlName][field] = value
-        end
+        GainBlock[controlName][field] = value
     end
 
 
