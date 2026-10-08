@@ -1,0 +1,1074 @@
+-- Log Gain
+-- A drop-in replacement for the Q-SYS Gain component. It looks and wires like
+-- a Gain block, but the fader uses a mixer-style logarithmic taper by default.
+--
+-- Signal path: one embedded mono Q-SYS "gain" block per channel, all driven
+-- from a single set of controls. With Meters enabled, each gain output also
+-- feeds an embedded mono "meter2" Level Meter (post-gain).
+--
+-- Pages:
+--   Control - bypass/invert/mute, position knob, dB readout, ramp controls.
+--   Fader   - fader with tapered dB scale, dB readout, bypass/invert/mute and
+--             ramp controls (+ summed meter if Meters on).
+--   Meters  - one meter per channel (only when Meters = true).
+--
+-- Controls:
+--   fader      - fader position (0-1). Drives the knob and the fader.
+--   gain       - gain in dB (Min..Max). Pin, snapshot and text-entry control.
+--   bypass     - bypasses all channels.
+--   mute       - mutes all channels.
+--   invert     - inverts polarity on all channels.
+--   increase / decrease / hold_off / ramp_time / step_meter
+--              - Gain-style ramp controls (Ramp Controls = true).
+--   channel_meter / sum_meter
+--              - post-gain level meters (Meters = true).
+--
+-- Moving the fader updates gain; setting gain (typed, pin or snapshot) moves
+-- the fader to the matching position on the taper.
+--
+-- Ramp controls (same behaviour as the Gain component):
+--   Click Increase/Decrease to nudge once; hold to ramp after Hold Off.
+--   Time is how long a held ramp takes to travel from Min to Max.
+--   Continuous: a click is 1 dB; a hold sweeps the fader along the taper.
+--   Discrete:   the fader throw is split into Number of Steps equal steps.
+--
+-- Logarithmic (Mixer) taper, relative to Max Gain (default Max = +10 dB):
+--   100% = Max      75% = Max-10   50% = Max-20   30% = Max-30
+--    20% = Max-40   12.5% = Max-50  5% = Max-70    0% = Min Gain
+-- With Max = +10 dB, unity (0 dB) sits at 75% of the throw, like a console.
+-- Linear (dB) taper maps fader position linearly from Min to Max.
+--
+-- Summed meter: power sum of the channel meters, 10*log10(sum(10^(L/10))).
+
+PluginInfo = {
+    Name = "Log Gain",
+    Version = "1.1.1",
+    BuildVersion = "1.1.1",
+    Id = "5594a024-13d9-4be2-bd49-62daec2b624e",
+    Author = "James Martin",
+    Description = "Gain component with an embedded gain block and a mixer-style logarithmic fader taper."
+}
+
+
+------------------------------------------------------------
+-- CONSTANTS
+------------------------------------------------------------
+
+TAPER_LOG    = "Logarithmic (Mixer)"
+TAPER_LINEAR = "Linear (dB)"
+
+RAMP_CONTINUOUS = "Continuous"
+RAMP_DISCRETE   = "Discrete"
+
+DEFAULT_MAX_GAIN = 10
+DEFAULT_MIN_GAIN = -100
+DEFAULT_GAIN     = 0
+DEFAULT_STEPS    = 8
+
+DEFAULT_HOLD_OFF_S  = 0.5
+DEFAULT_RAMP_TIME_S = 5
+
+-- Gain component limits.
+ABS_MAX_GAIN = 20
+ABS_MIN_GAIN = -100
+
+MAX_CHANNELS = 64
+
+METER_MIN = -60
+METER_MAX = 20
+METERS_PER_ROW = 16
+
+-- { fader position, dB below Max Gain }, top to bottom.
+LOG_LAW = {
+    { 1.000,   0 },
+    { 0.750, -10 },
+    { 0.500, -20 },
+    { 0.300, -30 },
+    { 0.200, -40 },
+    { 0.125, -50 },
+    { 0.050, -70 }
+}
+
+-- dB marks drawn beside the fader.
+SCALE_MARKS = { 20, 10, 5, 0, -5, -10, -20, -30, -40, -60, -100 }
+
+-- Schematic block colour, matching the native Gain component.
+COMPONENT_COLOR = { 191, 226, 249 }
+LABEL_COLOR     = { 0, 0, 0 }
+TICK_COLOR      = { 96, 96, 96 }
+
+-- Button/knob/entry colours sampled from the native Gain panel.
+BYPASS_COLOR      = { 239, 127, 162 }
+INVERT_COLOR      = { 255, 245, 123 }
+MUTE_COLOR        = { 255, 0, 0 }
+RAMP_BUTTON_COLOR = { 200, 200, 200 }
+KNOB_COLOR        = { 124, 155, 206 }
+ENTRY_COLOR       = { 255, 251, 195 }
+
+
+------------------------------------------------------------
+-- TAPER (shared by design time and runtime)
+------------------------------------------------------------
+
+function Clamp(value, low, high)
+    if value < low then return low end
+    if value > high then return high end
+    return value
+end
+
+
+-- Breakpoints from top (pos 1, Max) to bottom (pos 0, Min).
+function BuildTaper(minDb, maxDb, taper)
+    local points = {}
+
+    if taper == TAPER_LOG then
+        for _, point in ipairs(LOG_LAW) do
+            local db = maxDb + point[2]
+            if db > minDb then
+                points[#points + 1] = { pos = point[1], db = db }
+            end
+        end
+    else
+        points[1] = { pos = 1, db = maxDb }
+    end
+
+    points[#points + 1] = { pos = 0, db = minDb }
+
+    return points
+end
+
+
+function PositionToDb(points, pos)
+    pos = Clamp(pos, 0, 1)
+
+    for i = 1, #points - 1 do
+        local hi, lo = points[i], points[i + 1]
+        if pos >= lo.pos then
+            local t = (pos - lo.pos) / (hi.pos - lo.pos)
+            return lo.db + t * (hi.db - lo.db)
+        end
+    end
+
+    return points[#points].db
+end
+
+
+function DbToPosition(points, db)
+    db = Clamp(db, points[#points].db, points[1].db)
+
+    for i = 1, #points - 1 do
+        local hi, lo = points[i], points[i + 1]
+        if db >= lo.db then
+            local t = (db - lo.db) / (hi.db - lo.db)
+            return lo.pos + t * (hi.pos - lo.pos)
+        end
+    end
+
+    return 0
+end
+
+
+------------------------------------------------------------
+-- PROPERTY HELPERS
+------------------------------------------------------------
+
+function PropNumber(props, name, default)
+    local prop = props and props[name]
+    return prop and tonumber(prop.Value) or default
+end
+
+
+function PropBool(props, name)
+    local prop = props and props[name]
+    if not prop then return false end
+    return prop.Value == true or prop.Value == "Yes" or prop.Value == "true"
+end
+
+
+function ChannelCount(props)
+    return math.floor(Clamp(PropNumber(props, "Channel Count", 1), 1, MAX_CHANNELS))
+end
+
+
+function GainRange(props)
+    local maxDb = Clamp(PropNumber(props, "Max Gain (dB)", DEFAULT_MAX_GAIN), ABS_MIN_GAIN + 1, ABS_MAX_GAIN)
+    local minDb = Clamp(PropNumber(props, "Min Gain (dB)", DEFAULT_MIN_GAIN), ABS_MIN_GAIN, maxDb - 1)
+    return minDb, maxDb
+end
+
+
+function TaperName(props)
+    local prop = props and props["Taper"]
+    if prop and prop.Value == TAPER_LINEAR then
+        return TAPER_LINEAR
+    end
+    return TAPER_LOG
+end
+
+
+function TaperPoints(props)
+    local minDb, maxDb = GainRange(props)
+    return BuildTaper(minDb, maxDb, TaperName(props))
+end
+
+
+function DefaultGain(props)
+    local minDb, maxDb = GainRange(props)
+    return Clamp(DEFAULT_GAIN, minDb, maxDb)
+end
+
+
+function RampEnabled(props)
+    return PropBool(props, "Ramp Controls")
+end
+
+
+function RampDiscrete(props)
+    local prop = props and props["Ramp Mode"]
+    return RampEnabled(props) and prop ~= nil and prop.Value == RAMP_DISCRETE
+end
+
+
+function StepCount(props)
+    return math.floor(Clamp(PropNumber(props, "Number of Steps", DEFAULT_STEPS), 2, 100))
+end
+
+
+function MetersEnabled(props)
+    return PropBool(props, "Meters")
+end
+
+
+function PinName(base, count, index)
+    if count == 1 then
+        return base
+    end
+    return base .. " " .. tostring(index)
+end
+
+
+-- Layout name of one element of a control with Count = count.
+function ControlName(base, count, index)
+    if count == 1 then
+        return base
+    end
+    return base .. " " .. tostring(index)
+end
+
+
+function GainBlockName(index)
+    return "gain_block_" .. tostring(index)
+end
+
+
+function MeterBlockName(index)
+    return "meter_block_" .. tostring(index)
+end
+
+
+------------------------------------------------------------
+-- PLUGIN APPEARANCE
+------------------------------------------------------------
+
+function GetColor(props)
+    return COMPONENT_COLOR
+end
+
+
+function GetPrettyName(props)
+    return "Log Gain " .. PluginInfo.Version
+end
+
+
+------------------------------------------------------------
+-- PROPERTIES
+------------------------------------------------------------
+
+function GetProperties()
+    return {
+        {
+            Name = "Channel Count",
+            Type = "integer",
+            Min = 1,
+            Max = MAX_CHANNELS,
+            Value = 1
+        },
+        {
+            Name = "Taper",
+            Type = "enum",
+            Choices = { TAPER_LOG, TAPER_LINEAR },
+            Value = TAPER_LOG
+        },
+        {
+            Name = "Max Gain (dB)",
+            Type = "integer",
+            Min = ABS_MIN_GAIN + 1,
+            Max = ABS_MAX_GAIN,
+            Value = DEFAULT_MAX_GAIN
+        },
+        {
+            Name = "Min Gain (dB)",
+            Type = "integer",
+            Min = ABS_MIN_GAIN,
+            Max = ABS_MAX_GAIN - 1,
+            Value = DEFAULT_MIN_GAIN
+        },
+        {
+            Name = "Ramp Controls",
+            Type = "boolean",
+            Value = false
+        },
+        {
+            Name = "Ramp Mode",
+            Type = "enum",
+            Choices = { RAMP_CONTINUOUS, RAMP_DISCRETE },
+            Value = RAMP_CONTINUOUS
+        },
+        {
+            Name = "Number of Steps",
+            Type = "integer",
+            Min = 2,
+            Max = 100,
+            Value = DEFAULT_STEPS
+        },
+        {
+            Name = "Meters",
+            Type = "boolean",
+            Value = false
+        }
+    }
+end
+
+
+function RectifyProperties(props)
+    local ramp = RampEnabled(props)
+
+    props["Ramp Mode"].IsHidden = not ramp
+    props["Number of Steps"].IsHidden = not RampDiscrete(props)
+
+    return props
+end
+
+
+------------------------------------------------------------
+-- PAGES
+------------------------------------------------------------
+
+function PageNames(props)
+    local names = { "Control", "Fader" }
+
+    if MetersEnabled(props) then
+        names[#names + 1] = "Meters"
+    end
+
+    return names
+end
+
+
+function GetPages(props)
+    local pages = {}
+
+    for _, name in ipairs(PageNames(props)) do
+        pages[#pages + 1] = { name = name }
+    end
+
+    return pages
+end
+
+
+function CurrentPage(props)
+    local index = PropNumber(props, "page_index", 1)
+    return PageNames(props)[index] or "Control"
+end
+
+
+------------------------------------------------------------
+-- DSP
+------------------------------------------------------------
+
+function GetPins(props)
+    local pins = {}
+    local count = ChannelCount(props)
+
+    for i = 1, count do
+        pins[#pins + 1] = { Name = PinName("Input", count, i), Direction = "input" }
+    end
+
+    for i = 1, count do
+        pins[#pins + 1] = { Name = PinName("Output", count, i), Direction = "output" }
+    end
+
+    return pins
+end
+
+
+function GetComponents(props)
+    local components = {}
+    local minDb, maxDb = GainRange(props)
+    local meters = MetersEnabled(props)
+
+    for i = 1, ChannelCount(props) do
+        components[#components + 1] = {
+            Name = GainBlockName(i),
+            Type = "gain",
+            Properties = {
+                ["max_gain"] = maxDb,
+                ["min_gain"] = minDb,
+                ["multi_channel_type"] = 1
+            }
+        }
+
+        if meters then
+            components[#components + 1] = {
+                Name = MeterBlockName(i),
+                Type = "meter2",
+                Properties = {}
+            }
+        end
+    end
+
+    return components
+end
+
+
+function GetWiring(props)
+    local wiring = {}
+    local count = ChannelCount(props)
+    local meters = MetersEnabled(props)
+
+    for i = 1, count do
+        local block = GainBlockName(i)
+        wiring[#wiring + 1] = { PinName("Input", count, i), block .. " Input 1" }
+        wiring[#wiring + 1] = { block .. " Output 1", PinName("Output", count, i) }
+
+        if meters then
+            wiring[#wiring + 1] = { block .. " Output 1", MeterBlockName(i) .. " Input 1" }
+        end
+    end
+
+    return wiring
+end
+
+
+------------------------------------------------------------
+-- CONTROLS
+------------------------------------------------------------
+
+function GetControls(props)
+    local minDb, maxDb = GainRange(props)
+    local defaultGain = DefaultGain(props)
+
+    local controls = {
+        {
+            Name = "fader",
+            ControlType = "Knob",
+            ControlUnit = "Position",
+            Min = 0,
+            Max = 1,
+            DefaultValue = DbToPosition(TaperPoints(props), defaultGain),
+            Count = 1,
+            PinStyle = "Both",
+            UserPin = true
+        },
+        {
+            Name = "gain",
+            ControlType = "Knob",
+            ControlUnit = "dB",
+            Min = minDb,
+            Max = maxDb,
+            DefaultValue = defaultGain,
+            Count = 1,
+            PinStyle = "Both",
+            UserPin = true
+        },
+        {
+            Name = "bypass",
+            ControlType = "Button",
+            ButtonType = "Toggle",
+            Count = 1,
+            PinStyle = "Both",
+            UserPin = true
+        },
+        {
+            Name = "mute",
+            ControlType = "Button",
+            ButtonType = "Toggle",
+            Count = 1,
+            PinStyle = "Both",
+            UserPin = true
+        },
+        {
+            Name = "invert",
+            ControlType = "Button",
+            ButtonType = "Toggle",
+            Count = 1,
+            PinStyle = "Both",
+            UserPin = true
+        }
+    }
+
+    if RampEnabled(props) then
+        table.insert(controls, {
+            Name = "increase",
+            ControlType = "Button",
+            ButtonType = "Momentary",
+            Count = 1,
+            PinStyle = "Input",
+            UserPin = true
+        })
+
+        table.insert(controls, {
+            Name = "decrease",
+            ControlType = "Button",
+            ButtonType = "Momentary",
+            Count = 1,
+            PinStyle = "Input",
+            UserPin = true
+        })
+
+        table.insert(controls, {
+            Name = "hold_off",
+            ControlType = "Knob",
+            ControlUnit = "Seconds",
+            Min = 0,
+            Max = 10,
+            DefaultValue = DEFAULT_HOLD_OFF_S,
+            Count = 1,
+            PinStyle = "Both",
+            UserPin = true
+        })
+
+        table.insert(controls, {
+            Name = "ramp_time",
+            ControlType = "Knob",
+            ControlUnit = "Seconds",
+            Min = 0.1,
+            Max = 60,
+            DefaultValue = DEFAULT_RAMP_TIME_S,
+            Count = 1,
+            PinStyle = "Both",
+            UserPin = true
+        })
+
+        if RampDiscrete(props) then
+            table.insert(controls, {
+                Name = "step_meter",
+                ControlType = "Indicator",
+                IndicatorType = "Meter",
+                Min = 0,
+                Max = StepCount(props),
+                Count = 1,
+                PinStyle = "Output",
+                UserPin = true
+            })
+        end
+    end
+
+    if MetersEnabled(props) then
+        table.insert(controls, {
+            Name = "channel_meter",
+            ControlType = "Indicator",
+            IndicatorType = "Meter",
+            Min = METER_MIN,
+            Max = METER_MAX,
+            Count = ChannelCount(props),
+            PinStyle = "Output",
+            UserPin = true
+        })
+
+        table.insert(controls, {
+            Name = "sum_meter",
+            ControlType = "Indicator",
+            IndicatorType = "Meter",
+            Min = METER_MIN,
+            Max = METER_MAX,
+            Count = 1,
+            PinStyle = "Output",
+            UserPin = true
+        })
+    end
+
+    return controls
+end
+
+
+------------------------------------------------------------
+-- LAYOUT (mirrors the native Gain panel: centred labels left, controls right)
+------------------------------------------------------------
+
+-- Native Gain control sizes.
+BUTTON_SIZE = { 36, 16 }
+TEXT_SIZE   = { 36, 16 }
+KNOB_SIZE   = { 36, 36 }
+
+LABEL_W   = 72
+CONTROL_X = 80
+ROW_GAP   = 8
+MARGIN    = 8
+
+
+function AddLabel(graphics, text, x, y, w, h, align, fontSize)
+    table.insert(graphics, {
+        Type = "Label",
+        Text = text,
+        HTextAlign = align or "Center",
+        FontSize = fontSize or 11,
+        Color = LABEL_COLOR,
+        Position = { x, y },
+        Size = { w, h }
+    })
+end
+
+
+function ButtonLayout(prettyName, legend, color, x, y)
+    return {
+        PrettyName = prettyName,
+        Style = "Button",
+        FontSize = 11,
+        Legend = legend,
+        Color = color,
+        Position = { x, y },
+        Size = BUTTON_SIZE
+    }
+end
+
+
+function TextLayout(prettyName, x, y, color)
+    return {
+        PrettyName = prettyName,
+        Style = "Text",
+        FontSize = 11,
+        Color = color,
+        Position = { x, y },
+        Size = TEXT_SIZE
+    }
+end
+
+
+-- Rows of { label, control name, layout } in a native-style label/control column.
+-- Returns the y below the last row.
+function AddRows(layout, graphics, rows, x, y)
+    for _, row in ipairs(rows) do
+        local entry = row[3]
+        local h = entry.Size[2]
+
+        entry.Position = { x + CONTROL_X, y }
+        layout[row[2]] = entry
+
+        AddLabel(graphics, row[1], x, y + math.floor((h - 16) / 2), LABEL_W, 16)
+
+        y = y + h + ROW_GAP
+    end
+
+    return y
+end
+
+
+function StateRows()
+    return {
+        { "Bypass", "bypass", ButtonLayout("Bypass", nil, BYPASS_COLOR, 0, 0) },
+        { "Invert", "invert", ButtonLayout("Invert", nil, INVERT_COLOR, 0, 0) },
+        { "Mute",   "mute",   ButtonLayout("Mute", nil, MUTE_COLOR, 0, 0) }
+    }
+end
+
+
+function RampRows(props)
+    if not RampEnabled(props) then
+        return {}
+    end
+
+    local rows = {
+        { "Increase", "increase", ButtonLayout("Ramp~Increase", "+", RAMP_BUTTON_COLOR, 0, 0) },
+        { "Decrease", "decrease", ButtonLayout("Ramp~Decrease", "-", RAMP_BUTTON_COLOR, 0, 0) },
+        { "Hold Off", "hold_off", TextLayout("Ramp~Hold Off", 0, 0, ENTRY_COLOR) },
+        { "Time",     "ramp_time", TextLayout("Ramp~Time", 0, 0, ENTRY_COLOR) }
+    }
+
+    if RampDiscrete(props) then
+        rows[#rows + 1] = {
+            "Step", "step_meter",
+            {
+                PrettyName = "Ramp~Step Meter",
+                Style = "Meter",
+                MeterStyle = "Level",
+                ShowTextbox = false,
+                Size = TEXT_SIZE
+            }
+        }
+    end
+
+    return rows
+end
+
+
+function AppendRows(target, rows)
+    for _, row in ipairs(rows) do
+        target[#target + 1] = row
+    end
+    return target
+end
+
+
+function ControlPageLayout(props, layout, graphics)
+    local rows = StateRows()
+
+    rows[#rows + 1] = {
+        "Gain", "fader",
+        {
+            PrettyName = "Fader Position",
+            Style = "Knob",
+            Color = KNOB_COLOR,
+            Size = KNOB_SIZE
+        }
+    }
+
+    rows[#rows + 1] = { "Gain (dB)", "gain", TextLayout("Gain", 0, 0, ENTRY_COLOR) }
+
+    AppendRows(rows, RampRows(props))
+
+    AddRows(layout, graphics, rows, MARGIN, MARGIN)
+end
+
+
+function FaderPageLayout(props, layout, graphics)
+    local minDb, maxDb = GainRange(props)
+    local points = TaperPoints(props)
+    local meters = MetersEnabled(props)
+
+    local scaleW = 30
+    local faderX, faderY = MARGIN + scaleW + 10, MARGIN + 8
+    local faderW, faderH = 36, 200
+
+    -- Scale beside the fader, drawn on the actual taper so the log spacing is visible.
+    -- Fader thumbs travel inside the control, so inset the scale by half a thumb.
+    local thumbInset = 6
+    local travelTop = faderY + thumbInset
+    local travelH = faderH - (thumbInset * 2)
+
+    -- Bottom-up so the Min mark wins when log spacing crowds the end of the scale.
+    local lastY = math.huge
+
+    for index = #SCALE_MARKS, 1, -1 do
+        local db = SCALE_MARKS[index]
+        local y = 0
+
+        if db <= maxDb and db >= minDb then
+            local pos = DbToPosition(points, db)
+            y = math.floor(travelTop + (1 - pos) * travelH + 0.5)
+        end
+
+        if db <= maxDb and db >= minDb and lastY - y >= 12 then
+            lastY = y
+            AddLabel(graphics, (db > 0 and "+" or "") .. tostring(db), MARGIN, y - 6, scaleW, 12, "Right", 9)
+
+            table.insert(graphics, {
+                Type = "GroupBox",
+                Fill = TICK_COLOR,
+                StrokeWidth = 0,
+                Position = { MARGIN + scaleW + 2, y },
+                Size = { 6, 1 }
+            })
+        end
+    end
+
+    layout["fader"] = {
+        PrettyName = "Fader Position",
+        Style = "Fader",
+        ShowTextbox = false,
+        Position = { faderX, faderY },
+        Size = { faderW, faderH }
+    }
+
+    local right = faderX + faderW
+
+    if meters then
+        layout["sum_meter"] = {
+            PrettyName = "Meters~Sum",
+            Style = "Meter",
+            MeterStyle = "Level",
+            ShowTextbox = false,
+            Position = { right + 6, faderY },
+            Size = { 16, faderH }
+        }
+        AddLabel(graphics, "Sum", right + 2, faderY + faderH + 2, 24, 14, "Center", 11)
+        right = right + 22
+    end
+
+    layout["gain"] = TextLayout("Gain", faderX, faderY + faderH + 8, ENTRY_COLOR)
+
+    local rows = StateRows()
+    AppendRows(rows, RampRows(props))
+
+    AddRows(layout, graphics, rows, right + 8, MARGIN)
+end
+
+
+function MetersPageLayout(props, layout, graphics)
+    local count = ChannelCount(props)
+
+    local colW, meterW, meterH = 24, 16, 160
+    local rowH = meterH + 24
+
+    for i = 1, count do
+        local col = (i - 1) % METERS_PER_ROW
+        local row = math.floor((i - 1) / METERS_PER_ROW)
+
+        local x = MARGIN + col * colW
+        local y = MARGIN + row * rowH
+
+        layout[ControlName("channel_meter", count, i)] = {
+            PrettyName = "Meters~Channel " .. tostring(i),
+            Style = "Meter",
+            MeterStyle = "Level",
+            ShowTextbox = false,
+            Position = { x + math.floor((colW - meterW) / 2), y },
+            Size = { meterW, meterH }
+        }
+
+        AddLabel(graphics, tostring(i), x, y + meterH + 2, colW, 14, "Center", 11)
+    end
+end
+
+
+function GetControlLayout(props)
+    local layout = {}
+    local graphics = {}
+
+    local page = CurrentPage(props)
+
+    if page == "Fader" then
+        FaderPageLayout(props, layout, graphics)
+    elseif page == "Meters" then
+        MetersPageLayout(props, layout, graphics)
+    else
+        ControlPageLayout(props, layout, graphics)
+    end
+
+    return layout, graphics
+end
+
+
+------------------------------------------------------------
+-- RUNTIME
+------------------------------------------------------------
+
+if Controls then
+
+    CHANNEL_COUNT  = ChannelCount(Properties)
+    POINTS         = TaperPoints(Properties)
+    MIN_DB         = POINTS[#POINTS].db
+    MAX_DB         = POINTS[1].db
+    RAMP_ENABLED   = RampEnabled(Properties)
+    DISCRETE       = RampDiscrete(Properties)
+    STEPS          = StepCount(Properties)
+    METERS_ENABLED = MetersEnabled(Properties)
+
+    TICK_S        = 0.05
+    CLICK_STEP_DB = 1
+
+    GainBlocks = {}
+
+    for i = 1, CHANNEL_COUNT do
+        GainBlocks[i] = _G[GainBlockName(i)]
+    end
+
+
+    function SetBlocks(controlName, field, value)
+        for _, block in ipairs(GainBlocks) do
+            block[controlName][field] = value
+        end
+    end
+
+
+    function UpdateStepMeter()
+        if DISCRETE then
+            Controls.step_meter.Value = math.floor(Controls.fader.Value * STEPS + 0.5)
+        end
+    end
+
+
+    function ApplyGain(db)
+        SetBlocks("gain", "Value", db)
+        UpdateStepMeter()
+    end
+
+
+    function OnFaderMoved()
+        Controls.gain.Value = PositionToDb(POINTS, Controls.fader.Value)
+        ApplyGain(Controls.gain.Value)
+    end
+
+
+    function OnGainSet()
+        local db = Controls.gain.Value
+        Controls.fader.Value = DbToPosition(POINTS, db)
+        ApplyGain(db)
+    end
+
+
+    function SetPosition(pos)
+        Controls.fader.Value = Clamp(pos, 0, 1)
+        OnFaderMoved()
+    end
+
+
+    function SetGainDb(db)
+        Controls.gain.Value = Clamp(db, MIN_DB, MAX_DB)
+        OnGainSet()
+    end
+
+
+    Controls.fader.EventHandler = OnFaderMoved
+    Controls.gain.EventHandler = OnGainSet
+    Controls.bypass.EventHandler = function(ctl) SetBlocks("bypass", "Boolean", ctl.Boolean) end
+    Controls.mute.EventHandler = function(ctl) SetBlocks("mute", "Boolean", ctl.Boolean) end
+    Controls.invert.EventHandler = function(ctl) SetBlocks("invert", "Boolean", ctl.Boolean) end
+
+
+    ------------------------------------------------------------
+    -- Ramp controls
+    ------------------------------------------------------------
+
+    if RAMP_ENABLED then
+
+        RampDirection = 0
+        HeldFor = 0
+        NextStepAt = 0
+
+        RampTimer = Timer.New()
+
+
+        function StepOnce(direction)
+            if DISCRETE then
+                local scaled = Controls.fader.Value * STEPS
+                local step
+
+                if direction > 0 then
+                    step = math.floor(scaled + 1e-6) + 1
+                else
+                    step = math.ceil(scaled - 1e-6) - 1
+                end
+
+                SetPosition(Clamp(step, 0, STEPS) / STEPS)
+            else
+                SetGainDb(Controls.gain.Value + direction * CLICK_STEP_DB)
+            end
+        end
+
+
+        RampTimer.EventHandler = function()
+            if RampDirection == 0 then
+                RampTimer:Stop()
+                return
+            end
+
+            HeldFor = HeldFor + TICK_S
+
+            if HeldFor < Controls.hold_off.Value then
+                return
+            end
+
+            local rampTime = math.max(Controls.ramp_time.Value, 0.1)
+
+            if DISCRETE then
+                if HeldFor >= NextStepAt then
+                    StepOnce(RampDirection)
+                    NextStepAt = HeldFor + (rampTime / STEPS)
+                end
+            else
+                SetPosition(Controls.fader.Value + RampDirection * (TICK_S / rampTime))
+            end
+        end
+
+
+        function OnRampButton(direction, ctl)
+            if ctl.Boolean then
+                RampDirection = direction
+                HeldFor = 0
+                NextStepAt = Controls.hold_off.Value
+                StepOnce(direction)
+                RampTimer:Start(TICK_S)
+            elseif RampDirection == direction then
+                RampDirection = 0
+                RampTimer:Stop()
+            end
+        end
+
+
+        Controls.increase.EventHandler = function(ctl) OnRampButton(1, ctl) end
+        Controls.decrease.EventHandler = function(ctl) OnRampButton(-1, ctl) end
+
+    end
+
+
+    ------------------------------------------------------------
+    -- Meters
+    ------------------------------------------------------------
+
+    if METERS_ENABLED then
+
+        -- meter2 level control name; probed so a naming difference only disables that meter.
+        METER_CONTROL_CANDIDATES = { "meter.1", "meter", "level.1", "peak.1" }
+
+        MeterSources = {}
+
+
+        function FindMeterControl(block)
+            for _, name in ipairs(METER_CONTROL_CANDIDATES) do
+                local ok, control = pcall(function() return block[name] end)
+                if ok and control ~= nil then
+                    return control
+                end
+            end
+            return nil
+        end
+
+
+        for i = 1, CHANNEL_COUNT do
+            local block = _G[MeterBlockName(i)]
+            MeterSources[i] = block and FindMeterControl(block)
+
+            if not MeterSources[i] then
+                print("Log Gain: no level control found on " .. MeterBlockName(i))
+            end
+        end
+
+
+        function ChannelMeter(i)
+            if CHANNEL_COUNT == 1 then
+                return Controls.channel_meter
+            end
+            return Controls.channel_meter[i]
+        end
+
+
+        MeterTimer = Timer.New()
+
+        MeterTimer.EventHandler = function()
+            local energy = 0
+
+            for i = 1, CHANNEL_COUNT do
+                local source = MeterSources[i]
+                local db = source and source.Value or -120
+
+                ChannelMeter(i).Value = db
+                energy = energy + 10 ^ (db / 10)
+            end
+
+            Controls.sum_meter.Value = energy > 0 and 10 * math.log(energy, 10) or -120
+        end
+
+        MeterTimer:Start(TICK_S)
+
+    end
+
+
+    -- gain (dB) is the source of truth on start so snapshots and saved values
+    -- are recalled exactly, then the fader is re-aligned to the taper.
+    OnGainSet()
+    SetBlocks("bypass", "Boolean", Controls.bypass.Boolean)
+    SetBlocks("mute", "Boolean", Controls.mute.Boolean)
+    SetBlocks("invert", "Boolean", Controls.invert.Boolean)
+
+end
