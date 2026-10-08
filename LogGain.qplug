@@ -42,8 +42,8 @@
 
 PluginInfo = {
     Name = "Log Gain",
-    Version = "1.1.1",
-    BuildVersion = "1.1.1",
+    Version = "1.1.2",
+    BuildVersion = "1.1.2",
     Id = "5594a024-13d9-4be2-bd49-62daec2b624e",
     Author = "James Martin",
     Description = "Gain component with an embedded gain block and a mixer-style logarithmic fader taper."
@@ -624,7 +624,7 @@ function ButtonLayout(prettyName, legend, color, x, y)
     return {
         PrettyName = prettyName,
         Style = "Button",
-        FontSize = 11,
+        FontSize = 9,
         Legend = legend,
         Color = color,
         Position = { x, y },
